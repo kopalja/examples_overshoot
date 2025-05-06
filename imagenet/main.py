@@ -1,11 +1,14 @@
 import argparse
 import os
+import sys
+import copy
 import random
 import shutil
 import time
 import warnings
 from enum import Enum
 
+import pandas as pd
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -20,12 +23,18 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
+from torch.utils.tensorboard import SummaryWriter
+
+from sgd_overshoot import SGDO
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+parser.add_argument('--job_name', type=str, required=True)
+parser.add_argument('--optimizer_name', type=str, required=True)
+parser.add_argument('--overshoot', type=float, default=4.0)
 parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
@@ -126,6 +135,13 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
+    
+    # Prepare logs
+    base_dir = os.path.join("lightning_logs", f"{args.job_name}_{args.optimizer_name}_{args.overshoot}")
+    os.makedirs(base_dir, exist_ok=True)
+    version_dir = os.path.join(base_dir, f"version_{len(os.listdir(base_dir)) + 1}")
+    log_writer = SummaryWriter(log_dir=version_dir) # type: ignore
+    shutil.copy(sys.argv[0], os.path.join(version_dir, '__'.join(sys.argv)))
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
@@ -194,9 +210,17 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().to(device)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    if args.optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
+    elif args.optimizer_name == "sgdo":
+        optimizer = SGDO(model.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay,
+                                    overshoot=args.overshoot)
+    else:
+        raise Exception(f"Unsupported optimizer name: {args.optimizer_name}")
     
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
@@ -273,15 +297,29 @@ def main_worker(gpu, ngpus_per_node, args):
         validate(val_loader, model, criterion, args)
         return
 
+    train_stats, val_stats = [], []
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args)
+        new_train_stats = train(train_loader, model, criterion, optimizer, epoch, device, args, log_writer)
+        train_stats.extend(new_train_stats)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        if hasattr(optimizer, 'move_to_base'):
+            optimizer.move_to_base()
+            eval_model = copy.deepcopy(model)
+            optimizer.move_to_overshoot()
+        else:
+            eval_model = model
+        acc1, acc5 = validate(val_loader, eval_model, criterion, args)
+        log_writer.add_scalar("validation_acc1", acc1, epoch)
+        log_writer.add_scalar("validation_acc5", acc5, epoch)
+        val_stats.append({"validation_acc1": acc1, "validation_acc5": acc5})
+        pd.DataFrame(train_stats).to_csv(os.path.join(version_dir, "training_stats.csv"), index=False)
+        pd.DataFrame(val_stats).to_csv(os.path.join(version_dir, "validation_stats.csv"), index=False)
+        del eval_model
         
         scheduler.step()
         
@@ -301,7 +339,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, device, args):
+def train(train_loader, model, criterion, optimizer, epoch, device, args, log_writer):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -314,6 +352,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
     # switch to train mode
     model.train()
+    train_stats = []
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -327,6 +366,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         # compute output
         output = model(images)
         loss = criterion(output, target)
+        loss_val = loss.item()
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -345,6 +385,19 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
+            iteration = i + epoch * len(train_loader)
+            log_writer.add_scalar("train_basic_loss", loss_val, iteration)
+            train_stats.append({"train_basic_loss": loss_val})
+            if hasattr(optimizer, 'move_to_base'):
+                optimizer.move_to_base()
+                eval_model = copy.deepcopy(model)
+                optimizer.move_to_overshoot()
+                with torch.no_grad():    
+                    output = eval_model(images)
+                    shifted_loss = criterion(output, target).item()
+                log_writer.add_scalar("train_shifted_to_base_loss", shifted_loss, iteration)
+                train_stats[-1]["train_shifted_to_base_loss"] = shifted_loss
+    return train_stats
 
 
 def validate(val_loader, model, criterion, args):
@@ -406,7 +459,7 @@ def validate(val_loader, model, criterion, args):
 
     progress.display_summary()
 
-    return top1.avg
+    return top1.avg.item(), top5.avg.item()
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

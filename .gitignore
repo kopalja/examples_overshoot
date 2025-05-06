@@ -23,3 +23,7 @@ docs/venv
 # development
 .vscode
 **/.DS_Store
+
+imagenet/imagenet/
+imagenet/lightning_logs
+
