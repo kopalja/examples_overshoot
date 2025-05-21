@@ -1,14 +1,25 @@
 from __future__ import print_function
 import argparse
+import copy
+import os
+import sys
+import shutil
 import torch
+import pandas as pd
 import torch.utils.data
 from torch import nn, optim
 from torch.nn import functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
+from torch.utils.tensorboard import SummaryWriter
+
+from adamw_overshoot_delayed import AdamO
 
 
 parser = argparse.ArgumentParser(description='VAE MNIST Example')
+parser.add_argument('--job_name', type=str, required=True)
+parser.add_argument('--optimizer_name', type=str, required=True)
+parser.add_argument('--overshoot', type=float, default=4.0)
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
@@ -24,17 +35,7 @@ args = parser.parse_args()
 
 torch.manual_seed(args.seed)
 
-if args.accel and not torch.accelerator.is_available():
-    print("ERROR: accelerator is not available, try running on CPU")
-    sys.exit(1)
-if not args.accel and torch.accelerator.is_available():
-         print("WARNING: accelerator is available, run with --accel to enable it")
-
-if args.accel:
-    device = torch.accelerator.current_accelerator()
-else:
-    device = torch.device("cpu")
-
+device = torch.device("cuda")
 print(f"Using device: {device}")
 
 kwargs = {'num_workers': 1, 'pin_memory': True} if device=="cuda" else {}
@@ -77,7 +78,12 @@ class VAE(nn.Module):
 
 
 model = VAE().to(device)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+if args.optimizer_name == "adam":
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+elif args.optimizer_name == "adamo":
+    optimizer = AdamO(model.parameters(), lr=1e-3, weight_decay=0, overshoot=args.overshoot)
+else:
+    raise Exception(f"Unknown optimizer: {args.optimizer_name}")
 
 
 # Reconstruction + KL divergence losses summed over all elements and batch
@@ -95,7 +101,7 @@ def loss_function(recon_x, x, mu, logvar):
 
 def train(epoch):
     model.train()
-    train_loss = 0
+    train_loss, shifted_train_loss = 0, 0
     for batch_idx, (data, _) in enumerate(train_loader):
         data = data.to(device)
         optimizer.zero_grad()
@@ -103,6 +109,15 @@ def train(epoch):
         loss = loss_function(recon_batch, data, mu, logvar)
         loss.backward()
         train_loss += loss.item()
+        
+        if hasattr(optimizer, 'move_to_base'):
+            optimizer.move_to_base()
+            eval_model = copy.deepcopy(model)
+            optimizer.move_to_overshoot()
+            with torch.no_grad():    
+                recon_batch, mu, logvar = eval_model(data)
+                shifted_train_loss += loss_function(recon_batch, data, mu, logvar).item()
+        
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
@@ -112,6 +127,13 @@ def train(epoch):
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader.dataset)))
+    
+    train_stats = {
+        'train_loss': train_loss / len(train_loader.dataset),
+    }
+    if shifted_train_loss != 0:
+        train_stats['shifted_train_loss'] = shifted_train_loss / len(train_loader.dataset)
+    return train_stats
 
 
 def test(epoch):
@@ -131,13 +153,30 @@ def test(epoch):
 
     test_loss /= len(test_loader.dataset)
     print('====> Test set loss: {:.4f}'.format(test_loss))
+    return {'loss': test_loss}
 
 if __name__ == "__main__":
+    
+    # Prepare logs
+    base_dir = os.path.join("lightning_logs", f"{args.job_name}_{args.optimizer_name}_{args.overshoot}")
+    os.makedirs(base_dir, exist_ok=True)
+    version_dir = os.path.join(base_dir, f"version_{len(os.listdir(base_dir)) + 1}")
+    log_writer = SummaryWriter(log_dir=version_dir) # type: ignore
+    shutil.copy(sys.argv[0], os.path.join(version_dir, '__'.join(sys.argv)))
+    
+    train_stats, test_stats = [], []
     for epoch in range(1, args.epochs + 1):
-        train(epoch)
-        test(epoch)
+        train_stats.append(train(epoch))
+        if isinstance(optimizer, AdamO):
+            optimizer.move_to_base()
+        test_stats.append(test(epoch))
+        if isinstance(optimizer, AdamO):
+            optimizer.move_to_overshoot()
         with torch.no_grad():
             sample = torch.randn(64, 20).to(device)
             sample = model.decode(sample).cpu()
             save_image(sample.view(64, 1, 28, 28),
                        'results/sample_' + str(epoch) + '.png')
+
+    pd.DataFrame(train_stats).to_csv(os.path.join(version_dir, "training_stats.csv"), index=False)
+    pd.DataFrame(test_stats).to_csv(os.path.join(version_dir, "validation_stats.csv"), index=False)

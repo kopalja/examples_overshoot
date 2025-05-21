@@ -27,4 +27,5 @@ docs/venv
 
 imagenet/imagenet/
 imagenet/lightning_logs
+vae/lightning_logs
 
