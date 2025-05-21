@@ -35,7 +35,7 @@ parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('--job_name', type=str, required=True)
 parser.add_argument('--optimizer_name', type=str, required=True)
 parser.add_argument('--overshoot', type=float, default=4.0)
-parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
+parser.add_argument('data', metavar='DIR', nargs='?', default='/projects/p904-24-3/imagenet',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
