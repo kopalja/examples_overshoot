@@ -32,6 +32,7 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+parser.add_argument('--results_dir', type=str, default="/home/kopal/benchmarking-overshoot/results")
 parser.add_argument('--job_name', type=str, required=True)
 parser.add_argument('--optimizer_name', type=str, required=True)
 parser.add_argument('--overshoot', type=float, default=4.0)
@@ -137,7 +138,7 @@ def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
     
     # Prepare logs
-    base_dir = os.path.join("lightning_logs", f"{args.job_name}_{args.optimizer_name}_{args.overshoot}")
+    base_dir = os.path.join(args.results_dir, "imagenet", f"{args.job_name}_{args.optimizer_name}_{args.overshoot}")
     os.makedirs(base_dir, exist_ok=True)
     version_dir = os.path.join(base_dir, f"version_{len(os.listdir(base_dir)) + 1}")
     log_writer = SummaryWriter(log_dir=version_dir) # type: ignore

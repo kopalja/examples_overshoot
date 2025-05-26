@@ -17,6 +17,7 @@ from adamw_overshoot_delayed import AdamO
 
 
 parser = argparse.ArgumentParser(description='VAE MNIST Example')
+parser.add_argument('--results_dir', type=str, default="/home/kopal/benchmarking-overshoot/results")
 parser.add_argument('--job_name', type=str, required=True)
 parser.add_argument('--optimizer_name', type=str, required=True)
 parser.add_argument('--overshoot', type=float, default=4.0)
@@ -102,6 +103,7 @@ def loss_function(recon_x, x, mu, logvar):
 def train(epoch):
     model.train()
     train_loss, shifted_train_loss = 0, 0
+    train_stats = []
     for batch_idx, (data, _) in enumerate(train_loader):
         data = data.to(device)
         optimizer.zero_grad()
@@ -124,15 +126,26 @@ def train(epoch):
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader),
                 loss.item() / len(data)))
-
+                
+            iteration = batch_idx + epoch * len(train_loader)
+            log_writer.add_scalar("train_basic_loss", loss.item(), iteration)
+            train_stats.append({"train_basic_loss": loss.item()})
+            if hasattr(optimizer, 'move_to_base'):
+                optimizer.move_to_base()
+                eval_model = copy.deepcopy(model)
+                optimizer.move_to_overshoot()
+                with torch.no_grad():    
+                    recon_batch, mu, logvar = model(data)
+                    shifted_loss = loss_function(recon_batch, data, mu, logvar)
+                log_writer.add_scalar("train_shifted_to_base_loss", shifted_loss, iteration)
+                train_stats[-1]["train_shifted_to_base_loss"] = shifted_loss
+            else:
+                log_writer.add_scalar("train_shifted_to_base_loss", loss.item(), iteration)
+                train_stats[-1]["train_shifted_to_base_loss"] = loss.item()
+                
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader.dataset)))
     
-    train_stats = {
-        'train_loss': train_loss / len(train_loader.dataset),
-    }
-    if shifted_train_loss != 0:
-        train_stats['shifted_train_loss'] = shifted_train_loss / len(train_loader.dataset)
     return train_stats
 
 
@@ -153,23 +166,26 @@ def test(epoch):
 
     test_loss /= len(test_loader.dataset)
     print('====> Test set loss: {:.4f}'.format(test_loss))
-    return {'loss': test_loss}
+    return test_loss
 
 if __name__ == "__main__":
     
     # Prepare logs
-    base_dir = os.path.join("lightning_logs", f"{args.job_name}_{args.optimizer_name}_{args.overshoot}")
+    base_dir = os.path.join(args.results_dir, "vae", f"{args.job_name}_{args.optimizer_name}_{args.overshoot}")
     os.makedirs(base_dir, exist_ok=True)
-    version_dir = os.path.join(base_dir, f"version_{len(os.listdir(base_dir)) + 1}")
+    # version_dir = os.path.join(base_dir, f"version_{len(os.listdir(base_dir)) + 1}")
+    version_dir = os.path.join(base_dir, f"seed_{args.seed}")
     log_writer = SummaryWriter(log_dir=version_dir) # type: ignore
     shutil.copy(sys.argv[0], os.path.join(version_dir, '__'.join(sys.argv)))
     
     train_stats, test_stats = [], []
     for epoch in range(1, args.epochs + 1):
-        train_stats.append(train(epoch))
+        train_stats.extend(train(epoch))
         if isinstance(optimizer, AdamO):
             optimizer.move_to_base()
-        test_stats.append(test(epoch))
+        test_loss = test(epoch)
+        log_writer.add_scalar("test_loss", test_loss, epoch)
+        test_stats.append({"test_loss": test_loss})
         if isinstance(optimizer, AdamO):
             optimizer.move_to_overshoot()
         with torch.no_grad():
