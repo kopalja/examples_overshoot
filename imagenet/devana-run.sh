@@ -16,5 +16,6 @@ set -xe
 eval "$(conda shell.bash hook)"
 conda activate imagenet
 
+# TODO: Change single run setting
 python main.py --job_name overshoot --optimizer_name sgdo --overshoot 5 --seed 11 -a resnet50 imagenet
 
